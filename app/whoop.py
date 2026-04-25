@@ -1,7 +1,11 @@
 """WHOOP API v2 client.
 
-WHOOP uses OAuth2. After initial auth (one-time, via setup script), we store the
-refresh token in env and use it to mint short-lived access tokens, cached in SQLite.
+WHOOP uses OAuth2 with refresh-token rotation: every refresh call may issue
+a new refresh token and invalidate the old one. We persist the latest refresh
+token in SQLite (kv table) so it survives restarts.
+
+Initial bootstrap: env var WHOOP_REFRESH_TOKEN. After first refresh, we use
+the stored value.
 
 Docs: https://developer.whoop.com/api
 """
@@ -18,11 +22,24 @@ TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
 API_BASE = "https://api.prod.whoop.com/developer/v2"
 
 _TOKEN_KEY = "whoop_access_token"
+_REFRESH_KEY = "whoop_refresh_token"
+
+
+def _current_refresh_token() -> Optional[str]:
+    """Return the most recent refresh token (DB > env)."""
+    stored = storage.kv_get(_REFRESH_KEY)
+    if stored and stored.get("refresh_token"):
+        return stored["refresh_token"]
+    return Config.WHOOP_REFRESH_TOKEN or None
 
 
 async def _get_access_token() -> Optional[str]:
-    """Return a valid access token, refreshing if needed."""
-    if not Config.WHOOP_REFRESH_TOKEN:
+    """Return a valid access token, refreshing if needed.
+
+    Persists rotated refresh tokens to SQLite so we don't lose them.
+    """
+    refresh_token = _current_refresh_token()
+    if not refresh_token:
         return None
 
     cached = storage.kv_get(_TOKEN_KEY)
@@ -34,20 +51,35 @@ async def _get_access_token() -> Optional[str]:
             TOKEN_URL,
             data={
                 "grant_type": "refresh_token",
-                "refresh_token": Config.WHOOP_REFRESH_TOKEN,
+                "refresh_token": refresh_token,
                 "client_id": Config.WHOOP_CLIENT_ID,
                 "client_secret": Config.WHOOP_CLIENT_SECRET,
                 "scope": "offline read:recovery read:cycles read:sleep read:workout read:profile",
             },
         )
-        r.raise_for_status()
+        if r.status_code != 200:
+            # Surface a useful error so the bot's reply tells the user
+            # exactly what to do.
+            raise RuntimeError(
+                f"WHOOP token refresh failed ({r.status_code}): {r.text[:200]}. "
+                "You may need to re-run scripts/whoop_setup and update "
+                "WHOOP_REFRESH_TOKEN."
+            )
         data = r.json()
 
+    # Save the new access token
     token_info = {
         "access_token": data["access_token"],
         "expires_at": time.time() + data.get("expires_in", 3600) - 60,
     }
     storage.kv_set(_TOKEN_KEY, token_info)
+
+    # Save the rotated refresh token (KEY FIX — without this, the next
+    # refresh attempt fails with 400 invalid_grant)
+    new_refresh = data.get("refresh_token")
+    if new_refresh and new_refresh != refresh_token:
+        storage.kv_set(_REFRESH_KEY, {"refresh_token": new_refresh})
+
     return token_info["access_token"]
 
 
@@ -65,17 +97,38 @@ async def _get(path: str, params: dict | None = None) -> dict:
         return r.json()
 
 
+async def get_recent_cycles(days: int = 3) -> list[dict]:
+    """Recent physiological cycles (one per day usually).
+
+    In v2, recovery data is nested inside the cycle response — see
+    developer.whoop.com/docs/developing/user-data/recovery.
+    """
+    if not _current_refresh_token():
+        return []
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    data = await _get("/cycle", params={"start": start, "limit": days + 1})
+    return data.get("records", [])
+
+
 async def get_recovery_today() -> dict:
-    """Most recent recovery score (HRV, RHR, recovery %)."""
-    if not Config.WHOOP_REFRESH_TOKEN:
+    """Most recent recovery from the latest cycle."""
+    cycles = await get_recent_cycles(days=2)
+    if not cycles:
         return {}
-    start = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
-    data = await _get("/recovery", params={"start": start, "limit": 5})
-    records = data.get("records", [])
-    if not records:
+    latest = cycles[0]
+    cycle_id = latest.get("id")
+    if not cycle_id:
         return {}
-    latest = records[0]
-    score = latest.get("score", {})
+
+    # In v2 you fetch recovery for a specific cycle
+    try:
+        rec = await _get(f"/cycle/{cycle_id}/recovery")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return {}  # not all cycles have recovery yet
+        raise
+
+    score = rec.get("score", {}) or {}
     return {
         "recovery_pct": score.get("recovery_score"),
         "hrv_ms": score.get("hrv_rmssd_milli"),
@@ -86,8 +139,8 @@ async def get_recovery_today() -> dict:
 
 
 async def get_sleep_last_night() -> dict:
-    """Last night's sleep summary."""
-    if not Config.WHOOP_REFRESH_TOKEN:
+    """Last night's sleep summary (v2 endpoint)."""
+    if not _current_refresh_token():
         return {}
     start = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
     data = await _get("/activity/sleep", params={"start": start, "limit": 5})
@@ -95,8 +148,8 @@ async def get_sleep_last_night() -> dict:
     if not records:
         return {}
     latest = records[0]
-    score = latest.get("score", {})
-    stage = score.get("stage_summary", {})
+    score = latest.get("score", {}) or {}
+    stage = score.get("stage_summary", {}) or {}
     return {
         "performance_pct": score.get("sleep_performance_percentage"),
         "efficiency_pct": score.get("sleep_efficiency_percentage"),
@@ -110,28 +163,24 @@ async def get_sleep_last_night() -> dict:
 
 
 async def get_recent_strain(days: int = 3) -> list[dict]:
-    """Recent daily strain (cycles)."""
-    if not Config.WHOOP_REFRESH_TOKEN:
-        return []
-    start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    data = await _get("/cycle", params={"start": start, "limit": days + 1})
-    records = data.get("records", [])
+    """Recent daily strain from cycles."""
+    cycles = await get_recent_cycles(days=days)
     return [
         {
-            "date": r.get("start", "")[:10],
-            "strain": r.get("score", {}).get("strain"),
-            "avg_hr": r.get("score", {}).get("average_heart_rate"),
-            "max_hr": r.get("score", {}).get("max_heart_rate"),
-            "kj": r.get("score", {}).get("kilojoule"),
+            "date": (c.get("start") or "")[:10],
+            "strain": (c.get("score") or {}).get("strain"),
+            "avg_hr": (c.get("score") or {}).get("average_heart_rate"),
+            "max_hr": (c.get("score") or {}).get("max_heart_rate"),
+            "kj": (c.get("score") or {}).get("kilojoule"),
         }
-        for r in records
+        for c in cycles
     ]
 
 
 async def get_full_snapshot() -> dict:
     """Bundle everything Claude needs from WHOOP."""
-    if not Config.WHOOP_REFRESH_TOKEN:
-        return {"connected": False}
+    if not _current_refresh_token():
+        return {"connected": False, "reason": "WHOOP_REFRESH_TOKEN not set"}
     try:
         recovery = await get_recovery_today()
         sleep = await get_sleep_last_night()
