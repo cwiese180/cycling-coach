@@ -1,0 +1,50 @@
+# DigitalOcean App Platform spec.
+# Deploy with: doctl apps create --spec .do/app.yaml
+# Or paste contents into App Platform UI when creating the app.
+
+name: cycling-coach
+region: lon
+
+workers:
+  - name: bot
+    dockerfile_path: Dockerfile
+    source_dir: /
+    github:
+      repo: YOUR_GITHUB_USERNAME/cycling-coach
+      branch: main
+      deploy_on_push: true
+    instance_size_slug: basic-xxs
+    instance_count: 1
+    envs:
+      - key: TELEGRAM_TOKEN
+        type: SECRET
+      - key: ALLOWED_CHAT_IDS
+        type: GENERAL
+      - key: ANTHROPIC_API_KEY
+        type: SECRET
+      - key: CLAUDE_MODEL
+        value: claude-opus-4-5
+      - key: INTERVALS_API_KEY
+        type: SECRET
+      - key: INTERVALS_ATHLETE_ID
+        type: GENERAL
+      - key: WHOOP_CLIENT_ID
+        type: SECRET
+      - key: WHOOP_CLIENT_SECRET
+        type: SECRET
+      - key: WHOOP_REFRESH_TOKEN
+        type: SECRET
+      - key: ATHLETE_NAME
+        value: "Athlete"
+      - key: ATHLETE_FTP
+        value: "250"
+      - key: ATHLETE_GOAL
+        value: "Build cycling fitness consistently"
+      - key: ATHLETE_TIMEZONE
+        value: "Europe/London"
+      - key: BRIEFING_HOUR
+        value: "6"
+      - key: BRIEFING_MINUTE
+        value: "30"
+      - key: DB_PATH
+        value: /app/data/coach.db
