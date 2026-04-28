@@ -75,6 +75,8 @@ async def get_recent_activities_detail(days: int = DETAIL_DAYS) -> list[dict]:
             "max_hr": a.get("max_heartrate"),
             "tss": a.get("icu_training_load"),
             "intensity_pct": a.get("icu_intensity"),
+            "kj_burned": a.get("icu_joules") and round(a.get("icu_joules") / 1000),
+            "calories": a.get("calories"),
             "feel": a.get("feel"),
             "perceived_exertion": a.get("perceived_exertion"),
         }
