@@ -5,6 +5,8 @@ Smart-split data loading:
 - Last 90 days summarised by week (TSS, ride count, hours, elevation)
 - Full 90-day CTL/ATL/TSB curve (downsampled to weekly)
 - Last 14 days of daily wellness rows
+- Top segment efforts from recent rides
+- Trends on starred (favourite) segments
 
 Docs: https://intervals.icu/api
 Auth: HTTP Basic, username "API_KEY", password = your API key.
@@ -22,6 +24,8 @@ BASE = "https://intervals.icu/api/v1"
 
 DETAIL_DAYS = 14   # per-ride detail
 SUMMARY_DAYS = 90  # weekly summary horizon
+SEGMENT_TOP_N = 5  # top efforts to surface per ride
+STARRED_LOOKBACK_DAYS = 90  # how far back to look for starred segment efforts
 
 
 def _headers() -> dict:
@@ -215,17 +219,151 @@ async def get_current_form() -> dict:
     }
 
 
+# ---------- Segments (Option A + B) ----------
+
+async def _fetch_activity_segments(activity_id: str) -> list[dict]:
+    """Get all segment efforts for one activity."""
+    url = f"{BASE}/activity/{activity_id}/segment-efforts"
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            r = await client.get(url, headers=_headers())
+            r.raise_for_status()
+            return r.json()
+        except (httpx.HTTPStatusError, httpx.HTTPError):
+            return []
+
+
+async def get_top_segment_efforts_recent(days: int = DETAIL_DAYS, top_n: int = SEGMENT_TOP_N) -> list[dict]:
+    """For each ride in the last N days, surface the top segment efforts.
+
+    Selection: prioritise climb segments and high-power efforts over short flat ones.
+    Returns one flat list, most recent first.
+    """
+    activities = await _fetch_activities(days)
+    out: list[dict] = []
+    for a in activities:
+        aid = a.get("id")
+        if not aid:
+            continue
+        efforts = await _fetch_activity_segments(str(aid))
+        if not efforts:
+            continue
+        # Score each effort: power × duration weight, with bonus for climb segments
+        scored = []
+        for e in efforts:
+            seg = e.get("segment", {}) or {}
+            avg_w = e.get("average_watts") or 0
+            duration = e.get("elapsed_time") or 0
+            climb_bonus = 1.5 if seg.get("climb_category") else 1.0
+            score = avg_w * duration * climb_bonus
+            scored.append((score, e, seg))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        for _, e, seg in scored[:top_n]:
+            out.append(
+                {
+                    "ride_date": (a.get("start_date_local") or "")[:10],
+                    "ride_name": a.get("name"),
+                    "segment_name": seg.get("name"),
+                    "segment_id": seg.get("id"),
+                    "distance_m": seg.get("distance"),
+                    "avg_grade_pct": seg.get("average_grade"),
+                    "is_climb": bool(seg.get("climb_category")),
+                    "duration_sec": e.get("elapsed_time"),
+                    "avg_power": e.get("average_watts"),
+                    "max_power": e.get("max_watts"),
+                    "avg_hr": e.get("average_heartrate"),
+                    "rank_overall": e.get("kom_rank"),
+                    "is_pr": e.get("pr_rank") == 1,
+                }
+            )
+    return out
+
+
+async def get_starred_segments() -> list[dict]:
+    """List of segments the athlete has starred in Strava/Intervals."""
+    url = f"{BASE}/athlete/{Config.INTERVALS_ATHLETE_ID}/segments"
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            r = await client.get(url, headers=_headers(), params={"starred": "true"})
+            r.raise_for_status()
+            return r.json()
+        except (httpx.HTTPStatusError, httpx.HTTPError):
+            return []
+
+
+async def _fetch_segment_efforts(segment_id: str, days: int) -> list[dict]:
+    """All efforts on a given segment by this athlete in the lookback window."""
+    oldest, newest = _date_range(days)
+    url = f"{BASE}/athlete/{Config.INTERVALS_ATHLETE_ID}/segment-efforts"
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            r = await client.get(
+                url,
+                headers=_headers(),
+                params={"segment_id": segment_id, "oldest": oldest, "newest": newest},
+            )
+            r.raise_for_status()
+            return r.json()
+        except (httpx.HTTPStatusError, httpx.HTTPError):
+            return []
+
+
+async def get_starred_segment_trends(days: int = STARRED_LOOKBACK_DAYS) -> list[dict]:
+    """For each starred segment, return recent attempts so the coach can see trends.
+
+    Limits to last 5 attempts per segment, oldest first, so Claude can read the arc.
+    """
+    starred = await get_starred_segments()
+    out = []
+    for seg in starred[:20]:  # cap at 20 starred segments to keep prompt size sane
+        sid = seg.get("id")
+        if not sid:
+            continue
+        efforts = await _fetch_segment_efforts(str(sid), days)
+        if not efforts:
+            continue
+        # newest first from API; sort by date asc, take last 5
+        efforts_sorted = sorted(
+            efforts, key=lambda e: e.get("start_date_local") or "", reverse=False
+        )[-5:]
+        attempts = [
+            {
+                "date": (e.get("start_date_local") or "")[:10],
+                "duration_sec": e.get("elapsed_time"),
+                "avg_power": e.get("average_watts"),
+                "avg_hr": e.get("average_heartrate"),
+                "is_pr": e.get("pr_rank") == 1,
+            }
+            for e in efforts_sorted
+        ]
+        out.append(
+            {
+                "segment_name": seg.get("name"),
+                "segment_id": sid,
+                "distance_m": seg.get("distance"),
+                "avg_grade_pct": seg.get("average_grade"),
+                "is_climb": bool(seg.get("climb_category")),
+                "recent_attempts": attempts,
+            }
+        )
+    return out
+
+
 async def get_full_snapshot() -> dict[str, Any]:
-    """Bundle smart-split data: recent detail + 90-day summary + form."""
+    """Bundle smart-split data: recent detail + 90-day summary + form + segments."""
     detail = await get_recent_activities_detail(DETAIL_DAYS)
     weekly = await get_weekly_summary(SUMMARY_DAYS)
     wellness = await get_wellness_recent(DETAIL_DAYS)
     fitness_curve = await get_fitness_curve_weekly(SUMMARY_DAYS)
     form = await get_current_form()
+    top_efforts = await get_top_segment_efforts_recent(DETAIL_DAYS, SEGMENT_TOP_N)
+    starred_trends = await get_starred_segment_trends(STARRED_LOOKBACK_DAYS)
     return {
         "form_today": form,
         "fitness_curve_weekly_90d": fitness_curve,
         "training_summary_weekly_90d": weekly,
         "activities_detail_last_14d": detail,
         "wellness_last_14d": wellness,
+        "top_segment_efforts_last_14d": top_efforts,
+        "starred_segments_trends_90d": starred_trends,
     }
