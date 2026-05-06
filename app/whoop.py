@@ -2,13 +2,21 @@
 
 WHOOP uses OAuth2 with refresh-token rotation: every refresh call may issue
 a new refresh token and invalidate the old one. We persist the latest refresh
-token in SQLite (kv table) so it survives restarts.
+token in:
+  1. SQLite (kv table) — primary, fast lookup
+  2. A flat file at /app/data/whoop_refresh_token.txt — belt-and-braces, also
+     visible to the operator if they need to copy it out
+
+We also LOG the rotated token at INFO level on every change so it shows up in
+DigitalOcean Runtime Logs as a recovery path of last resort.
 
 Initial bootstrap: env var WHOOP_REFRESH_TOKEN. After first refresh, we use
 the stored value.
 
 Docs: https://developer.whoop.com/api
 """
+import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -18,25 +26,51 @@ import httpx
 from app.config import Config
 from app import storage
 
+log = logging.getLogger("whoop")
+
 TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
 API_BASE = "https://api.prod.whoop.com/developer/v2"
 
 _TOKEN_KEY = "whoop_access_token"
 _REFRESH_KEY = "whoop_refresh_token"
+_REFRESH_FILE = "/app/data/whoop_refresh_token.txt"
+
+
+def _read_refresh_file() -> Optional[str]:
+    """Read refresh token from disk file, if present."""
+    try:
+        with open(_REFRESH_FILE) as f:
+            tok = f.read().strip()
+        return tok or None
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _write_refresh_file(token: str) -> None:
+    """Persist refresh token to disk as a fallback to SQLite."""
+    try:
+        os.makedirs(os.path.dirname(_REFRESH_FILE), exist_ok=True)
+        with open(_REFRESH_FILE, "w") as f:
+            f.write(token)
+    except OSError as e:
+        log.warning("Could not write refresh token to file: %s", e)
 
 
 def _current_refresh_token() -> Optional[str]:
-    """Return the most recent refresh token (DB > env)."""
+    """Return the most recent refresh token (DB > file > env)."""
     stored = storage.kv_get(_REFRESH_KEY)
     if stored and stored.get("refresh_token"):
         return stored["refresh_token"]
+    file_tok = _read_refresh_file()
+    if file_tok:
+        return file_tok
     return Config.WHOOP_REFRESH_TOKEN or None
 
 
 async def _get_access_token() -> Optional[str]:
     """Return a valid access token, refreshing if needed.
 
-    Persists rotated refresh tokens to SQLite so we don't lose them.
+    Persists rotated refresh tokens to SQLite + file + log so we don't lose them.
     """
     refresh_token = _current_refresh_token()
     if not refresh_token:
@@ -62,8 +96,7 @@ async def _get_access_token() -> Optional[str]:
             # exactly what to do.
             raise RuntimeError(
                 f"WHOOP token refresh failed ({r.status_code}): {r.text[:200]}. "
-                "You may need to re-run scripts/whoop_setup and update "
-                "WHOOP_REFRESH_TOKEN."
+                "Re-run scripts/whoop_setup and update WHOOP_REFRESH_TOKEN."
             )
         data = r.json()
 
@@ -74,11 +107,18 @@ async def _get_access_token() -> Optional[str]:
     }
     storage.kv_set(_TOKEN_KEY, token_info)
 
-    # Save the rotated refresh token (KEY FIX — without this, the next
-    # refresh attempt fails with 400 invalid_grant)
+    # Save the rotated refresh token to BOTH SQLite and a file (so even if
+    # SQLite gets wiped by a redeploy, the file survives if we have a volume,
+    # AND we log the token prominently so the operator can recover it from
+    # Runtime Logs if both fail).
     new_refresh = data.get("refresh_token")
     if new_refresh and new_refresh != refresh_token:
         storage.kv_set(_REFRESH_KEY, {"refresh_token": new_refresh})
+        _write_refresh_file(new_refresh)
+        log.info(
+            "WHOOP_REFRESH_TOKEN rotated. Latest token (copy this if needed): %s",
+            new_refresh,
+        )
 
     return token_info["access_token"]
 
