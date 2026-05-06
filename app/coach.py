@@ -1,5 +1,9 @@
 """Claude coaching brain. Builds the system prompt and calls the API."""
 import json
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from anthropic import AsyncAnthropic
 
 from app.config import Config
@@ -9,6 +13,11 @@ _client = AsyncAnthropic(api_key=Config.ANTHROPIC_API_KEY)
 
 
 SYSTEM_PROMPT = """You are Jans — an experienced, no-nonsense cycling coach delivering personalised guidance via Telegram. You give it to the athlete straight. You respect them enough to tell the truth, not to make them feel good.
+
+CURRENT CONTEXT
+- Today is {today_full} ({today_short})
+- Athlete's local time: {local_time} {tz}
+{race_countdown}
 
 ATHLETE PROFILE
 - Name: {name}
@@ -93,12 +102,78 @@ Answer the actual question. Reference their data when relevant. If they ask some
 """
 
 
+def _race_countdown() -> str:
+    """Detect a race date in ATHLETE_GOAL and return a countdown line.
+
+    Looks for patterns like '16 May 2026' or '2026-05-16' in the goal string.
+    Falls back to empty string if nothing parseable is found.
+    """
+    goal = Config.ATHLETE_GOAL or ""
+    # Try ISO format first
+    iso_match = re.search(r"(\d{4})-(\d{2})-(\d{2})", goal)
+    race_date = None
+    if iso_match:
+        try:
+            race_date = datetime(
+                int(iso_match.group(1)),
+                int(iso_match.group(2)),
+                int(iso_match.group(3)),
+            ).date()
+        except ValueError:
+            pass
+
+    # Try "16 May 2026" / "16th May 2026"
+    if not race_date:
+        months = {
+            "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+            "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
+            "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "sept": 9,
+            "september": 9, "oct": 10, "october": 10, "nov": 11, "november": 11,
+            "dec": 12, "december": 12,
+        }
+        m = re.search(
+            r"(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\s+(\d{4})", goal
+        )
+        if m:
+            day = int(m.group(1))
+            mon = months.get(m.group(2).lower())
+            year = int(m.group(3))
+            if mon:
+                try:
+                    race_date = datetime(year, mon, day).date()
+                except ValueError:
+                    pass
+
+    if not race_date:
+        return ""
+
+    today = datetime.now(ZoneInfo(Config.ATHLETE_TIMEZONE)).date()
+    delta = (race_date - today).days
+    if delta < 0:
+        return f"- Race date ({race_date.isoformat()}) has passed — set a new goal."
+    if delta == 0:
+        return f"- RACE DAY today ({race_date.isoformat()})."
+    if delta <= 7:
+        return f"- Race day in {delta} days ({race_date.isoformat()}) — TAPER WEEK. Freshness over fitness."
+    if delta <= 21:
+        return f"- Race day in {delta} days ({race_date.isoformat()}) — final taper phase."
+    if delta <= 42:
+        return f"- Race day in {delta} days ({race_date.isoformat()}) — late build, sharpening."
+    return f"- Race day in {delta} days ({race_date.isoformat()})."
+
+
 def _build_system() -> str:
+    tz = ZoneInfo(Config.ATHLETE_TIMEZONE)
+    now = datetime.now(tz)
     return SYSTEM_PROMPT.format(
         name=Config.ATHLETE_NAME,
         ftp=Config.ATHLETE_FTP,
         goal=Config.ATHLETE_GOAL,
         tz=Config.ATHLETE_TIMEZONE,
+        today_full=now.strftime("%A %d %B %Y"),
+        today_short=now.strftime("%Y-%m-%d"),
+        local_time=now.strftime("%H:%M"),
+        race_countdown=_race_countdown(),
     )
 
 
